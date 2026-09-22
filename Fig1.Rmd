@@ -1,0 +1,739 @@
+---
+title: "Fig 1"
+author: "Katsuhiro Ito"
+date: "2026-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(rtracklayer)
+library(DESeq2)
+library(ggnewscale)
+library(ggrepel)
+library(ggrastr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+
+###clean environment###
+rm(list = ls())
+
+```
+
+## Data load
+
+```{r data load}
+file <- list.files("./matrix/")
+file
+
+# old run
+
+oldfile <- file %>% str_subset(pattern = "^Sample_LRS")
+oldlist <- lapply(1:length(oldfile), FUN = function(x){
+  dir <- paste("./matrix/", oldfile[x], sep = "")
+  y <- read.table(dir, header = T)
+  return(y)
+})
+
+olddf <- data.frame(oldlist[[1]]$expected_count)
+olddf <- cbind(olddf, oldlist[[2]]$expected_count)
+for(i in 3:length(oldfile)){
+  olddf <- cbind(olddf, oldlist[[i]]$expected_count)
+}
+
+colnames(olddf) <- oldfile %>% str_remove_all(pattern = "Sample_|.rsem.genes.results")
+
+olddf$gene_id <- oldlist[[1]]$gene_id
+
+oldtpm <- data.frame(oldlist[[1]]$TPM)
+for(i in 2:length(oldfile)){
+  oldtpm <- cbind(oldtpm, oldlist[[i]]$TPM)
+}
+
+colnames(oldtpm) <- oldfile %>% str_remove_all(pattern = "Sample_|.rsem.genes.results")
+oldtpm$gene_id <- oldlist[[1]]$gene_id
+
+
+
+# 2nd run
+
+newfile <- file %>% str_subset(pattern = "^Sample_.[0-9]")
+
+newlist <- lapply(1:length(newfile), FUN = function(x){
+  dir <- paste("./matrix/", newfile[x], sep = "")
+  y <- read.table(dir, header = T)
+  return(y)
+})
+
+newdf <- data.frame(newlist[[1]]$expected_count)
+newdf <- cbind(newdf, newlist[[2]]$expected_count)
+for(i in 3:length(newfile)){
+  newdf <- cbind(newdf, newlist[[i]]$expected_count)
+}
+
+colnames(newdf) <- newfile %>% str_remove_all(pattern = ".rsem.genes.results")
+
+newdf$gene_id <- newlist[[1]]$gene_id
+
+newtpm <- data.frame(newlist[[1]]$TPM)
+for(i in 2:length(newfile)){
+  newtpm <- cbind(newtpm, newlist[[i]]$TPM)
+}
+
+colnames(newtpm) <- newfile %>% str_remove_all(pattern = ".rsem.genes.results")
+newtpm$gene_id <- newlist[[1]]$gene_id
+
+
+# merge files
+
+gtf_data <- import("./references/GRCh38.gencode.collapsed.gtf")
+
+gtf_df <- data.frame(geneid = as.vector(gtf_data$gene_id), genename = as.vector(gtf_data$gene_name))
+
+gtf_df <- gtf_df　%>% distinct(geneid,genename)
+
+table(duplicated(gtf_df$geneid))
+#no duplicated ensemblids
+
+table(duplicated(gtf_df$genename))
+#1264 duplicated genenames
+
+newdf<- newdf %>% left_join(gtf_df, by = c("gene_id" = "geneid"))
+newtpm<- newtpm %>% left_join(gtf_df, by = c("gene_id" = "geneid"))
+
+olddf<- olddf %>% left_join(gtf_df, by = c("gene_id" = "geneid"))
+oldtpm<- oldtpm %>% left_join(gtf_df, by = c("gene_id" = "geneid"))
+
+### merge data ###
+setdiff(olddf$gene_id,newdf$gene_id)
+setdiff(newdf$gene_id,olddf$gene_id)
+
+### 27 genes were not detected in new dataset ###
+olddf[olddf$gene_id %in% setdiff(olddf$gene_id,newdf$gene_id),]
+
+
+mergeddf <- newdf %>% left_join(olddf, by = "gene_id")
+
+mergeddf <- mergeddf %>% dplyr::select(starts_with("Sample"),starts_with("LRS"),genename = genename.x)
+
+mergedtpm <- newtpm %>% left_join(oldtpm, by = "gene_id")
+
+mergedtpm <- mergedtpm %>% dplyr::select(starts_with("Sample"),starts_with("LRS"),genename = genename.x)
+
+### 1633 gene duplicated: sum counts ###
+table(duplicated(mergeddf$genename))
+
+mergeddf <- mergeddf %>% group_by(genename) %>% summarise(across(where(is.numeric), sum, na.rm = TRUE))
+
+table(duplicated(mergeddf$genename))
+
+
+
+```
+
+## DESEQ
+
+
+```{r deseq2}
+
+mergedcoldata <- data.frame(condition = ifelse(str_detect(colnames(mergeddf)[2:33], pattern = "NT|WT"), "WT",
+                                               ifelse(str_detect(colnames(mergeddf)[2:33], pattern = "HIF1a"), "HIF1a",
+                                                      ifelse(str_detect(colnames(mergeddf)[2:33], pattern = "HIF2a"), "HIF2a",
+                                                             ifelse(str_detect(colnames(mergeddf)[2:33], pattern = "Belz"), "Bel","NC")
+                                                      )
+                                               )
+),
+id = str_split(colnames(mergeddf)[2:33], pattern = "_|-", simplify = T)[,2],
+batch = c(rep("new",16),rep("old",16))
+)
+
+mergedcoldata$sample <- colnames(mergeddf)[2:33]
+mergedcoldata$condition <- factor(mergedcoldata$condition, levels = c("WT", "NC","Bel", "HIF1a", "HIF2a"))
+rownames(mergedcoldata) <- mergedcoldata$sample
+
+
+
+
+######## deseq
+
+deseq.custom <- function(dfset, coldata, cond, paired = F, batch = F){
+  if(length(cond) != 1 ){
+    message("2 group should be provided with |")
+    message("For example, A|B")
+    exit
+  }
+  coldata.comparison <- coldata %>% filter(str_detect(condition, pattern = cond))
+  dfset.comparison <- dfset %>% dplyr::select(coldata.comparison$sample)
+  rownames(dfset.comparison) <- dfset$gene_id
+  print(colnames(dfset.comparison))
+  if(paired){
+    if(batch){
+      dds <- DESeqDataSetFromMatrix(round(dfset.comparison), colData = coldata.comparison, design = ~id + batch + condition)
+    }else{
+      dds <- DESeqDataSetFromMatrix(round(dfset.comparison), colData = coldata.comparison, design = ~id + condition)
+    }
+  }else{
+    dds <- DESeqDataSetFromMatrix(round(dfset.comparison), colData = coldata.comparison, design = ~ condition)
+  }
+  dds <- DESeq(dds)
+  res <- results(dds)
+  res.dfset <- data.frame(res)
+  res.dfset$gene <- rownames(res.dfset)
+  
+  res.dfset$genename <- dfset$genename
+  
+  return(res.dfset)
+}
+
+
+WTvsHIF1apairedfinal <- deseq.custom(mergeddf,coldata = mergedcoldata, cond = "HIF1a|WT", paired = T, batch = F)
+
+WTvsHIF1apairedfinal <- WTvsHIF1apairedfinal %>% 
+  mutate(color = case_when(padj < 0.05 & log2FoldChange > 1 ~ "red",
+                           padj < 0.05 & log2FoldChange < -1 ~ "blue",
+                           TRUE ~ "grey"),
+         label = if_else(genename %in% c("VEGFA","PGK1","CXCR5","CXCR6"), genename,"")) 
+
+
+### remove 38 and 42 according to KO data, see text
+WTvsHIF2apairedfinal <- deseq.custom(mergeddf %>% select(-starts_with("LRS_42"), -starts_with("LRS_38")),coldata = mergedcoldata %>% dplyr::filter(id != 42 & id !=38), cond = "HIF2a|WT", paired = T, batch = F)
+
+WTvsHIF2apairedfinal <- WTvsHIF2apairedfinal %>% 
+  mutate(color = case_when(padj < 0.05 & log2FoldChange > 1 ~ "red",
+                           padj < 0.05 & log2FoldChange < -1 ~ "blue",
+                           TRUE ~ "grey"),
+         label = if_else(genename %in% c("IFNG","IL2","TNF", "EPAS1"), genename,"")) 
+
+
+```
+
+
+### Figure 1
+
+
+```{r Fig 1}
+ggplot(WTvsHIF1apairedfinal, aes(x = log2FoldChange, y = -log10(padj))) + 
+  rasterise(geom_point(aes(color = color),size = 0.2), dpi = 600) + 
+  scale_color_manual(values = c("lightblue","lightgrey","lightpink")) +
+  new_scale_color() +
+  geom_label_repel(aes(label = label, color = color),size = 2, max.overlaps = 10000000) +
+  scale_color_manual(values = c("blue","grey","red")) +
+  geom_vline(xintercept = 1, linetype = 3) +
+  geom_vline(xintercept = -1, linetype = 3) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 3) +
+  scale_x_continuous(breaks = c(-6,-4,-2,2,4,6), limits = c(-7,7)) +
+  scale_y_continuous(breaks = c(0,25,50,75), limits = c(0,100)) +
+  labs(x = "Log2 Fold Change", y = "-log10 adjusted p value") + 
+  theme_classic() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 6))
+
+ggsave("WTvsHIF1aKO.png", width = 3, height = 2, units = "in")
+ggsave("WTvsHIF1aKO.svg", width = 3, height = 2, units = "in")
+
+ggplot(WTvsHIF2apairedfinal, aes(x = log2FoldChange, y = -log10(padj))) + 
+  rasterise(geom_point(aes(color = color),size = 0.2), dpi = 600) + 
+  scale_color_manual(values = c("lightblue","lightgrey","lightpink")) +
+  new_scale_color() +
+  geom_label_repel(aes(label = label, color = color),size = 2, max.overlaps = 10000000) +
+  scale_color_manual(values = c("blue","grey","red")) +
+  geom_vline(xintercept = 1, linetype = 3) +
+  geom_vline(xintercept = -1, linetype = 3) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 3) +
+  scale_x_continuous(breaks = c(-6,-4,-2,2,4,6), limits = c(-7,7)) +
+  scale_y_continuous(breaks = c(0,2.5,5,7.5,10), limits = c(0,10)) +
+  labs(x = "Log2 Fold Change", y = "-log10 adjusted p value") + 
+  theme_classic() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 6))
+
+ggsave("WTvsHIF2aKO.png", width = 3, height = 2, units = "in")
+ggsave("WTvsHIF2aKO.svg", width = 3, height = 2, units = "in")
+```
+
+### Supplementary Figure 1
+
+```{r}
+############ gene list ########
+hif <- read.table("./20260805hypoxiagenelist.txt")
+
+WTvsHIF1apairedfinal <- WTvsHIF1apairedfinal %>% 
+  mutate(color = case_when(padj < 0.05 & log2FoldChange > 1 ~ "red",
+                           padj < 0.05 & log2FoldChange < -1 ~ "blue",
+                           TRUE ~ "grey"),
+         label = if_else(genename %in% hif$V1 & abs(padj) < 0.05 & abs(log2FoldChange) > 1, genename,"")) 
+
+
+ggplot(WTvsHIF1apairedfinal, aes(x = log2FoldChange, y = -log10(padj))) + 
+  rasterise(geom_point(aes(color = color),size = 0.2), dpi = 600) + 
+  scale_color_manual(values = c("lightblue","lightgrey","lightpink")) +
+  new_scale_color() +
+  geom_label_repel(aes(label = label, color = color),size = 2, max.overlaps = 10000000) +
+  scale_color_manual(values = c("blue","grey","red")) +
+  geom_vline(xintercept = 1, linetype = 3) +
+  geom_vline(xintercept = -1, linetype = 3) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 3) +
+  scale_x_continuous(breaks = c(-6,-4,-2,2,4,6), limits = c(-7,7)) +
+  scale_y_continuous(breaks = c(0,25,50,75), limits = c(0,100)) +
+  labs(x = "Log2 Fold Change", y = "-log10 adjusted p value") + 
+  theme_classic() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 6))
+
+ggsave("WTvsHIF1aKO_Hypoxiagenes.png", width = 3, height = 2, units = "in")
+ggsave("WTvsHIF1aKO_Hypoxiagenes.svg", width = 3, height = 2, units = "in")
+
+ggsave("WTvsHIF1aKO_Hypoxiagenes_large.png", width = 6, height = 4, units = "in")
+ggsave("WTvsHIF1aKO_Hypoxiagenes_large.svg", width = 6, height = 4, units = "in")
+
+
+WTvsHIF2apairedfinal <- WTvsHIF2apairedfinal %>% 
+  mutate(color = case_when(padj < 0.05 & log2FoldChange > 1 ~ "red",
+                           padj < 0.05 & log2FoldChange < -1 ~ "blue",
+                           TRUE ~ "grey"),
+         label = if_else(genename %in% hif$V1 & abs(padj) < 0.05, genename,"")) 
+
+
+ggplot(WTvsHIF2apairedfinal, aes(x = log2FoldChange, y = -log10(padj))) + 
+  rasterise(geom_point(aes(color = color),size = 0.2), dpi = 600) + 
+  scale_color_manual(values = c("lightblue","lightgrey","lightpink")) +
+  new_scale_color() +
+  geom_label_repel(aes(label = label, color = color),size = 2, max.overlaps = 10000000) +
+  scale_color_manual(values = c("blue","grey","red")) +
+  geom_vline(xintercept = 1, linetype = 3) +
+  geom_vline(xintercept = -1, linetype = 3) + 
+  geom_hline(yintercept = -log10(0.05), linetype = 3) +
+  scale_x_continuous(breaks = c(-6,-4,-2,2,4,6), limits = c(-7,7)) +
+  scale_y_continuous(breaks = c(0,2.5,5,7.5,10), limits = c(0,10)) +
+  labs(x = "Log2 Fold Change", y = "-log10 adjusted p value") + 
+  theme_classic() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 6))
+
+ggsave("WTvsHIF2aKO_hypoxia.png", width = 3, height = 2, units = "in")
+ggsave("WTvsHIF2aKO_hypoxia.svg", width = 3, height = 2, units = "in")
+
+
+
+```
+
+### save files
+```{r save files}
+
+write.csv(WTvsHIF1apairedfinal, file = "results/WTvsHIF1afinal.csv", quote = F,row.names = T,
+          col.names = F)
+write.csv(WTvsHIF2apairedfinal, file = "results/WTvsHIF2afinal.csv", quote = F,row.names = T,
+          col.names = F)
+write.csv(mergeddf, file = "results/finaldf.csv", quote = F,row.names = T,
+          col.names = F)
+```
+
+
+### Enrichment analysis
+
+```{r, enrichment}
+res_hif1a_df <- read_csv("results/WTvsHIF1afinal.csv" )
+res_hif2a_df <- read_csv("results/WTvsHIF2afinal.csv" )
+
+
+
+# Add ENTREZID mapping to both dataframes
+res_hif1a_df$ENTREZID <- mapIds(org.Hs.eg.db,
+                                keys = res_hif1a_df$genename,
+                                column = "ENTREZID",
+                                keytype = "SYMBOL",
+                                multiVals = "first")
+
+res_hif2a_df$ENTREZID <- mapIds(org.Hs.eg.db,
+                                keys = res_hif2a_df$genename,
+                                column = "ENTREZID",
+                                keytype = "SYMBOL",
+                                multiVals = "first")
+
+
+# Define thresholds
+padj_threshold <- 0.05
+#lfc_threshold <- 0
+lfc_threshold <- 1
+
+# HIF1a gene lists
+hif1a_up_genes <- res_hif1a_df %>%
+  dplyr::filter(padj < padj_threshold & log2FoldChange > lfc_threshold) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  as.character()
+
+hif1a_down_genes <-  res_hif1a_df %>%
+  dplyr::filter(padj < padj_threshold & log2FoldChange < -lfc_threshold) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  as.character()
+
+# HIF2a gene lists
+hif2a_up_genes <-  res_hif2a_df %>%
+  dplyr::filter(padj < padj_threshold & log2FoldChange > lfc_threshold) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  as.character()
+
+hif2a_down_genes <-  res_hif2a_df %>%
+  dplyr::filter(padj < padj_threshold & log2FoldChange < -lfc_threshold) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  as.character()
+
+# Universe
+universe <-  res_hif1a_df %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  as.character()
+
+message("Gene counts for enrichment:")
+message(paste("HIF1a Up:", length(hif1a_up_genes)))
+message(paste("HIF1a Down:", length(hif1a_down_genes)))
+message(paste("HIF2a Up:", length(hif2a_up_genes)))
+message(paste("HIF2a Down:", length(hif2a_down_genes)))
+
+## HIF1a Pathway Analysis
+# GO enrichment for HIF1a upregulated genes
+hif1a_go_up <- NULL
+if(length(hif1a_up_genes) > 5) {
+  hif1a_go_up <- enrichGO(
+    gene = hif1a_up_genes,
+    universe = universe,
+    keyType = "ENTREZID",
+    OrgDb = org.Hs.eg.db,
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  
+  if(nrow(as.data.frame(hif1a_go_up)) > 0) {
+    p <- dotplot(hif1a_go_up, showCategory = 20) +
+      ggtitle("HIF1a KO: GO Enrichment (Upregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant GO terms for HIF1a upregulated genes")
+  }
+}
+
+# GO enrichment for HIF1a downregulated genes
+hif1a_go_down <- NULL
+if(length(hif1a_down_genes) > 5) {
+  hif1a_go_down <- enrichGO(
+    gene = hif1a_down_genes,
+    universe = universe,
+    keyType = "ENTREZID",
+    OrgDb = org.Hs.eg.db,
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  
+  if(nrow(as.data.frame(hif1a_go_down)) > 0) {
+    p <- dotplot(hif1a_go_down, showCategory = 20) +
+      ggtitle("HIF1a KO: GO Enrichment (Downregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant GO terms for HIF1a downregulated genes")
+  }
+}
+
+# KEGG enrichment for HIF1a
+hif1a_kegg_up <- NULL
+if(length(hif1a_up_genes) > 5) {
+  hif1a_kegg_up <- enrichKEGG(
+    gene = hif1a_up_genes,
+    universe = universe,
+    organism = "hsa",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if(nrow(as.data.frame(hif1a_kegg_up)) > 0) {
+    hif1a_kegg_up <- setReadable(hif1a_kegg_up, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    p <- dotplot(hif1a_kegg_up, showCategory = 20) +
+      ggtitle("HIF1a KO: KEGG Pathways (Upregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant KEGG pathways for HIF1a upregulated genes")
+  }
+}
+
+hif1a_kegg_down <- NULL
+if(length(hif1a_down_genes) > 5) {
+  hif1a_kegg_down <- enrichKEGG(
+    gene = hif1a_down_genes,
+    universe = universe,
+    organism = "hsa",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if(nrow(as.data.frame(hif1a_kegg_down)) > 0) {
+    hif1a_kegg_down <- setReadable(hif1a_kegg_down, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    p <- dotplot(hif1a_kegg_down, showCategory = 20) +
+      ggtitle("HIF1a KO: KEGG Pathways (Downregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant KEGG pathways for HIF1a downregulated genes")
+  }
+}
+## HIF2a Pathway Analysis
+
+# GO enrichment for HIF2a upregulated genes
+hif2a_go_up <- NULL
+if(length(hif2a_up_genes) > 0) {
+  hif2a_go_up <- enrichGO(
+    gene = hif2a_up_genes,
+    universe = universe,
+    keyType = "ENTREZID",
+    OrgDb = org.Hs.eg.db,
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  
+  if(nrow(as.data.frame(hif2a_go_up)) > 0) {
+    p <- dotplot(hif2a_go_up, showCategory = 20) +
+      ggtitle("HIF2a KO: GO Enrichment (Upregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant GO terms for HIF2a upregulated genes")
+  }
+}
+
+# GO enrichment for HIF2a downregulated genes
+hif2a_go_down <- NULL
+if(length(hif2a_down_genes) > 0) {
+  hif2a_go_down <- enrichGO(
+    gene = hif2a_down_genes,
+    universe = universe,
+    keyType = "ENTREZID",
+    OrgDb = org.Hs.eg.db,
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  
+  if(nrow(as.data.frame(hif2a_go_down)) > 0) {
+    p <- dotplot(hif2a_go_down, showCategory = 20) +
+      ggtitle("HIF2a KO: GO Enrichment (Downregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant GO terms for HIF2a downregulated genes")
+  }
+}
+
+# KEGG enrichment for HIF2a
+hif2a_kegg_up <- NULL
+if(length(hif2a_up_genes) > 0) {
+  hif2a_kegg_up <- enrichKEGG(
+    gene = hif2a_up_genes,
+    universe = universe,
+    organism = "hsa",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if(nrow(as.data.frame(hif2a_kegg_up)) > 0) {
+    hif2a_kegg_up <- setReadable(hif2a_kegg_up, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    p <- dotplot(hif2a_kegg_up, showCategory = 20) +
+      ggtitle("HIF2a KO: KEGG Pathways (Upregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant KEGG pathways for HIF2a upregulated genes")
+  }
+}
+
+hif2a_kegg_down <- NULL
+if(length(hif2a_down_genes) > 0) {
+  hif2a_kegg_down <- enrichKEGG(
+    gene = hif2a_down_genes,
+    universe = universe,
+    organism = "hsa",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  if(nrow(as.data.frame(hif2a_kegg_down)) > 0) {
+    hif2a_kegg_down <- setReadable(hif2a_kegg_down, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    p <- dotplot(hif2a_kegg_down, showCategory = 20) +
+      ggtitle("HIF2a KO: KEGG Pathways (Downregulated)") +
+      theme(axis.text.y = element_text(size = 9))
+    print(p)
+  } else {
+    message("No significant KEGG pathways for HIF2a downregulated genes")
+  }
+}
+
+###save
+write.csv(as.data.frame(hif1a_go_up), file = "results/hif1agoup.csv", quote = F)
+write.csv(as.data.frame(hif1a_go_down), file = "results/hif1agodown.csv", quote = F)
+write.csv(as.data.frame(hif2a_go_up), file = "results/hif2agoup.csv", quote = F)
+write.csv(as.data.frame(hif2a_go_down), file = "results/hif2agodown.csv", quote = F)
+
+
+write.csv(as.data.frame(hif1a_kegg_up), file = "results/hif1akeggup.csv", quote = F)
+write.csv(as.data.frame(hif1a_kegg_down), file = "results/hif1akeggdown.csv", quote = F)
+write.csv(as.data.frame(hif2a_kegg_up), file = "results/hif2akeggup.csv", quote = F)
+write.csv(as.data.frame(hif2a_kegg_down), file = "results/hif2akeggdown.csv", quote = F)
+
+
+# Function to create pathway bar plot
+create_pathway_barplot <- function(data, title, n_pathways = 10, bar_color = "#2E86AB") {
+  
+  # tryCatch
+  df <- tryCatch({
+    data
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (!length(df) > 0) {
+    message("No enrichment data")
+    return(NULL)
+  }
+  
+  # Select top pathways and prepare data
+  plot_data <- data %>%
+    arrange(p.adjust) %>%
+    slice_head(n = n_pathways) %>%
+    mutate(
+      neglog10_padj = -log10(p.adjust),
+      # Wrap long descriptions for better display
+      Description = str_wrap(Description, width = 50),
+      # Order by significance for plotting
+      Description = factor(Description, levels = rev(Description))
+    )
+  
+  # Create bar plot
+  p <- ggplot(plot_data, aes(x = neglog10_padj, y = Description)) +
+    geom_bar(stat = "identity", fill = bar_color, alpha = 0.8) +
+    geom_vline(xintercept = -log10(0.05), linetype = "dashed",
+               color = "red", alpha = 0.5, linewidth = 0.5) +
+    labs(
+      title = title,
+      x = "-Log10 (Adjusted P-value)",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+      axis.text.y = element_text(size = 9.5),
+      axis.text.x = element_text(size = 10),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90")
+    ) +
+    scale_x_continuous(expand = c(0, 0),
+                       limits = c(0, max(plot_data$neglog10_padj) * 1.1))
+  
+  return(p)
+}
+
+# HIF1a downregulated pathways (top 10)
+p_hif1a_path <- create_pathway_barplot(
+  as.data.frame(hif1a_go_down),
+  "HIF1α KO: Top 10 Downregulated GO Pathways",
+  n_pathways = 10,
+  bar_color = "#2E86AB"
+)
+
+print(p_hif1a_path)
+
+ggsave("HIF1aKO_bar.svg", width = 10, height = 6, unit = "in")
+ggsave("HIF1aKO_bar.png", width = 10, height = 6, unit = "in")
+
+# HIF2a downregulated pathways (top 10)
+p_hif2a_path <- create_pathway_barplot(
+  as.data.frame(hif2a_go_down),
+  "HIF2α KO: Top 10 Downregulated GO Pathways",
+  n_pathways = 10,
+  bar_color = "#A23B72"
+)
+
+print(p_hif2a_path)
+
+ggsave("HIF2aKO_bar.svg", width = 10, height = 6, unit = "in")
+ggsave("HIF2aKO_bar.png", width = 10, height = 6, unit = "in")
+
+
+
+```
+
+# sessioninfo
+
+```{r}
+sessionInfo()
+```
+
+Warning: Your system is mis-configured: ‘/etc/localtime’ is not a symlinkR version 4.4.1 (2024-06-14)
+Platform: x86_64-pc-linux-gnu
+Running under: Red Hat Enterprise Linux 9.6 (Plow)
+
+Matrix products: default
+BLAS/LAPACK: FlexiBLAS OPENBLAS;  LAPACK version 3.10.1
+
+locale:
+ [1] LC_CTYPE=C.UTF-8       LC_NUMERIC=C           LC_TIME=C.UTF-8        LC_COLLATE=C.UTF-8     LC_MONETARY=C.UTF-8    LC_MESSAGES=C.UTF-8    LC_PAPER=C.UTF-8      
+ [8] LC_NAME=C              LC_ADDRESS=C           LC_TELEPHONE=C         LC_MEASUREMENT=C.UTF-8 LC_IDENTIFICATION=C   
+
+time zone: NA
+tzcode source: system (glibc)
+
+attached base packages:
+[1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] clusterProfiler_4.12.0      org.Hs.eg.db_3.19.1         AnnotationDbi_1.66.0        ggrastr_1.0.2               ggrepel_0.9.5               ggnewscale_0.4.10          
+ [7] rtracklayer_1.64.0          lubridate_1.9.3             forcats_1.0.0               stringr_1.5.1               dplyr_1.2.1                 purrr_1.0.2                
+[13] readr_2.1.5                 tidyr_1.3.2                 tibble_3.2.1                ggplot2_4.0.3               tidyverse_2.0.0             DESeq2_1.44.0              
+[19] SummarizedExperiment_1.34.0 Biobase_2.64.0              MatrixGenerics_1.16.0       matrixStats_1.3.0           GenomicRanges_1.56.1        GenomeInfoDb_1.40.1        
+[25] IRanges_2.38.0              S4Vectors_0.42.0            BiocGenerics_0.50.0        
+
+loaded via a namespace (and not attached):
+  [1] RColorBrewer_1.1-3       rstudioapi_0.16.0        jsonlite_1.8.8           magrittr_2.0.3           ggbeeswarm_0.7.2         farver_2.1.2             rmarkdown_2.27          
+  [8] ragg_1.3.2               BiocIO_1.14.0            fs_1.6.4                 zlibbioc_1.50.0          vctrs_0.7.3              Cairo_1.6-2              Rsamtools_2.20.0        
+ [15] memoise_2.0.1            RCurl_1.98-1.14          ggtree_3.12.0            htmltools_0.5.8.1        S4Arrays_1.4.1           curl_5.2.1               SparseArray_1.4.8       
+ [22] gridGraphics_0.5-1       plyr_1.8.9               cachem_1.1.0             GenomicAlignments_1.40.0 igraph_2.0.3             lifecycle_1.0.5          pkgconfig_2.0.3         
+ [29] Matrix_1.7-0             R6_2.5.1                 fastmap_1.2.0            gson_0.1.0               GenomeInfoDbData_1.2.12  digest_0.6.36            aplot_0.2.3             
+ [36] enrichplot_1.24.0        colorspace_2.1-0         patchwork_1.2.0          textshaping_0.4.0        RSQLite_2.3.7            labeling_0.4.3           fansi_1.0.6             
+ [43] timechange_0.3.0         httr_1.4.7               polyclip_1.10-6          abind_1.4-5              compiler_4.4.1           bit64_4.0.5              withr_3.0.0             
+ [50] S7_0.2.2                 BiocParallel_1.38.0      viridis_0.6.5            DBI_1.2.3                ggforce_0.4.2            MASS_7.3-61              DelayedArray_0.30.1     
+ [57] rjson_0.2.21             HDO.db_0.99.1            tools_4.4.1              vipor_0.4.7              beeswarm_0.4.0           ape_5.8                  scatterpie_0.2.3        
+ [64] glue_1.7.0               restfulr_0.0.15          nlme_3.1-165             GOSemSim_2.30.0          grid_4.4.1               rsconnect_1.3.1          shadowtext_0.1.3        
+ [71] reshape2_1.4.4           fgsea_1.30.0             generics_0.1.3           gtable_0.3.6             tzdb_0.4.0               data.table_1.15.4        hms_1.1.3               
+ [78] tidygraph_1.3.1          utf8_1.2.4               XVector_0.44.0           pillar_1.9.0             vroom_1.6.5              yulab.utils_0.1.4        splines_4.4.1           
+ [85] tweenr_2.0.3             treeio_1.28.0            lattice_0.22-6           bit_4.0.5                tidyselect_1.2.1         GO.db_3.19.1             locfit_1.5-9.10         
+ [92] Biostrings_2.72.1        knitr_1.47               gridExtra_2.3            xfun_0.45                graphlayouts_1.1.1       stringi_1.8.4            UCSC.utils_1.0.0        
+ [99] lazyeval_0.2.2           ggfun_0.1.5              yaml_2.3.8               evaluate_0.24.0          codetools_0.2-20         ggraph_2.2.1             qvalue_2.36.0           
+[106] ggplotify_0.1.2          cli_3.6.3                systemfonts_1.1.0        dichromat_2.0-0.1        Rcpp_1.1.1-1.1           png_0.1-8                XML_3.99-0.16.1         
+[113] parallel_4.4.1           blob_1.2.4               DOSE_3.30.1              bitops_1.0-7             viridisLite_0.4.2        tidytree_0.4.6           scales_1.4.0            
+[120] crayon_1.5.3             rlang_1.3.0              cowplot_1.2.0            fastmatch_1.1-4          KEGGREST_1.44.1         
