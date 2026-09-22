@@ -91,17 +91,18 @@ Raw expression values were processed and normalized as appropriate for each anal
 The specific R scripts used for each analysis are provided in the corresponding directories of this repository.
 
 
-### Repository structure
+### structure
 
 - README.md
   - references/
-    - genome.fa 
-    - GRCh38.gencode.collapsed.gtf
-    - star_index_oh90
+    - genome.fa (should be downloaded from gs://gtex-resources)
+    - GRCh38.gencode.collapsed.gtf (should be downloaded from gs://gtex-resources)
+    - star_index_oh90 
     - rsem_reference
   - matrix/
   - scripts/
     - Fig1.R
+    - mergeddf.csv
   - sample20260630.txt
   - 20260805hypoxiagenelist.txt
   - results
