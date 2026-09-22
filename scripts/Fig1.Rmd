@@ -25,6 +25,9 @@ rm(list = ls())
 
 ## Data load
 
+This section could be skipped if *mergeddf.csv* is loaded.
+
+
 ```{r data load}
 file <- list.files("./matrix/")
 file
@@ -130,7 +133,7 @@ mergeddf <- mergeddf %>% group_by(genename) %>% summarise(across(where(is.numeri
 
 table(duplicated(mergeddf$genename))
 
-
+write.csv(x = mergeddf,file = "mergeddf.csv", quote = FALSE)
 
 ```
 
