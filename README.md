@@ -52,6 +52,7 @@ apptainer exec --bind ./:/data gtex_rnaseq_V11.sif bash -c " \
 ### STAR alignment
 
 STAR alignment was performed using the `run_STAR.py` script included in the container.
+SAMPLENAME.txt should include the names of the fastq files.
 
 ```bash
 SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" SAMPLENAME.txt)
@@ -90,19 +91,18 @@ Gene-level RSEM expression estimates were used as the primary input for downstre
 Raw expression values were processed and normalized as appropriate for each analysis.  
 The specific R scripts used for each analysis are provided in the corresponding directories of this repository.
 
+For convenience, datasets for figures are stored in the scripts directory.
 
 ### structure
 
 - README.md
-  - references/
-    - genome.fa (should be downloaded from gs://gtex-resources)
-    - GRCh38.gencode.collapsed.gtf (should be downloaded from gs://gtex-resources)
-    - star_index_oh90 
-    - rsem_reference
-  - matrix/
   - scripts/
-    - Fig1.R
-    - mergeddf.csv
-  - SAMPLENAME.txt
+    - Fig1.Rmd
+    - Fig1.html
+    - Fig4andSuppleFig5.Rmd
+    - Fig4andSuppleFig5.html
+    - mergeddf.csv (dataset for Fig1)
+    - df_forFig4.csv (datase for Fig4 and SuppleFig5)
+    - 
   - 20260805hypoxiagenelist.txt
-  - results
+
